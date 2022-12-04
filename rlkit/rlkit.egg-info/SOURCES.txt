@@ -1,3 +1,4 @@
+LICENSE
 README.md
 setup.py
 rlkit/__init__.py

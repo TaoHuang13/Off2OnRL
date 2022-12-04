@@ -30,7 +30,6 @@ from rlkit.torch.torch_rl_algorithm import (
 from rlkit.torch.distributions import TanhNormal
 from rlkit.torch.core import torch_ify, elem_or_tuple_to_numpy
 
-
 ######################################################################
 ######################################################################
 
@@ -76,7 +75,6 @@ class DenseLayer(nn.Module):
             return self.activation(x)  # (num_ensemble_size, batch_size, out_dim)
 
 
-
 class ParallelMlp(nn.Module):
     def __init__(
         self,
@@ -96,6 +94,7 @@ class ParallelMlp(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_hidden_layers = num_hidden_layers
         self.init_w = init_w
+        self.lamda = 100
 
         self.h1 = DenseLayer(
             ensemble_size,
@@ -137,6 +136,16 @@ class ParallelMlp(nn.Module):
         x = self.output(x)
         return x
 
+    def q_value_with_ucb(self, x1, x2):
+        qs = []
+        for i in range(x2.size(0)):
+            qs.append(self.forward(x1.repeat(self.ensemble_size, 1, 1), x2[i].repeat(self.ensemble_size, 1, 1)).detach())
+        qs = torch.stack(qs)
+        qs_std = torch.std(qs, dim=1)
+        qs_mean = torch.mean(qs, dim=1)
+        qs_ucb = qs_mean + self.lamda * qs_std
+        return qs_ucb.squeeze(-1)
+
     def weight_norm(self):
         return (
             torch.norm(self.h1.weights)
@@ -148,9 +157,10 @@ class ParallelMlp(nn.Module):
 ######################################################################
 
 class ParallelTanhGaussianPolicy(nn.Module):
-    def __init__(self, policies):
+    def __init__(self, policies, q_funcs):
         super(ParallelTanhGaussianPolicy, self).__init__()
         self.policies = nn.ModuleList(policies)
+        self.q_funcs = q_funcs
 
     def forward(self, obs):
         mean_list, std_list = [], []
@@ -174,6 +184,17 @@ class ParallelTanhGaussianPolicy(nn.Module):
         
         return TanhNormal(avg_mean, avg_std)
 
+    def get_ucb_actions(self, obs):
+        obs = torch_ify(obs)
+        actions = []
+        for policy in self.policies:
+            tanh_normal = policy(obs)
+            action = tanh_normal.sample()
+            actions.append(action)
+        
+        return torch.stack(actions, dim=0)
+
+
     def logprob(self, action, mean, std):
         tanh_normal = TanhNormal(mean, std)
         log_prob = tanh_normal.log_prob(
@@ -186,8 +207,11 @@ class ParallelTanhGaussianPolicy(nn.Module):
         self,
         obs_np,
     ):
-        actions = self.get_actions(obs_np[None])
-        return actions[0, :], {}
+        with torch.no_grad():
+            actions = self.get_ucb_actions(obs_np[None])
+            qs = self.q_funcs.q_value_with_ucb(torch_ify(obs_np[None]), actions)
+            index = torch.argmax(qs)
+            return actions[index, :][0].cpu().numpy(), {}
 
     def get_actions(
         self,
@@ -205,6 +229,67 @@ class ParallelTanhGaussianPolicy(nn.Module):
 
     def reset(self):
         pass
+
+
+# class ParallelTanhGaussianPolicy(nn.Module):
+#     def __init__(self, policies, q_funcs):
+#         super(ParallelTanhGaussianPolicy, self).__init__()
+#         self.policies = nn.ModuleList(policies)
+#         self.q_funcs = q_funcs
+
+#     def forward(self, obs):
+#         mean_list, std_list = [], []
+#         for policy in self.policies:
+#             tanh_normal = policy(obs)
+#             mean = tanh_normal.normal_mean.unsqueeze(0)  # 64, 6
+#             std = tanh_normal.normal_std.unsqueeze(0)  # 64, 6
+#             mean_list.append(mean)
+#             std_list.append(std)
+
+#         means = torch.cat(mean_list)
+#         stds = torch.cat(std_list)
+
+#         avg_mean = means.mean(0).unsqueeze(0)  # (1, 64, 6)
+#         avg_var = (means ** 2 + stds ** 2).mean(0).unsqueeze(0) - avg_mean ** 2
+#         avg_std = avg_var.sqrt()
+
+#         avg_mean = avg_mean.squeeze(0)
+#         avg_std = avg_std.squeeze(0)
+#         avg_std = torch.clamp(avg_std, np.exp(LOG_SIG_MIN), np.exp(LOG_SIG_MAX))
+        
+#         return TanhNormal(avg_mean, avg_std)
+
+#     def logprob(self, action, mean, std):
+#         tanh_normal = TanhNormal(mean, std)
+#         log_prob = tanh_normal.log_prob(
+#             action,
+#         )
+#         log_prob = log_prob.sum(dim=1, keepdim=True)
+#         return log_prob
+
+#     def get_action(
+#         self,
+#         obs_np,
+#     ):
+#         actions = self.get_actions(obs_np[None])
+#         return actions[0, :], {}
+
+#     def get_actions(
+#         self,
+#         obs_np,
+#     ):
+#         dist = self._get_dist_from_np(obs_np)
+#         actions = dist.sample()
+#         return elem_or_tuple_to_numpy(actions)
+
+#     def _get_dist_from_np(self, *args, **kwargs):
+#         torch_args = tuple(torch_ify(x) for x in args)
+#         torch_kwargs = {k: torch_ify(v) for k, v in kwargs.items()}
+#         dist = self.forward(*torch_args, **torch_kwargs)
+#         return dist
+
+#     def reset(self):
+#         pass
 
 
 def experiment(variant, args):
@@ -286,7 +371,7 @@ def experiment(variant, args):
         )
         policies.append(ens_policy)
 
-    policy = ParallelTanhGaussianPolicy(policies).to(ptu.device)
+    policy = ParallelTanhGaussianPolicy(policies, target_qf1).to(ptu.device)
 
     target_qf1.load_state_dict(qf1.state_dict())
     target_qf2.load_state_dict(qf2.state_dict())
